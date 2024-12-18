@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 	"time"
 
@@ -17,6 +19,7 @@ import (
 const (
 	maxFollowups        = 5    // Maximum number of follow-up analyses
 	maxOutputCharacters = 3000 // Maximum number of characters from command output to send to OpenAI
+	commandTimeout      = 10 * time.Second
 )
 
 // Check represents a single command check.
@@ -58,35 +61,125 @@ type Report struct {
 
 var checks = OSChecks{
 	MacOS: []Check{
-		{Command: "system_profiler SPUSBDataType -json", Prompt: "Look for any suspicious USB devices."},
-		{Command: "ps -Ao user,pid,%cpu,%mem,comm", Prompt: "Analyze processes for unusual CPU or memory usage."},
-		{Command: "netstat -an", Prompt: "Identify suspicious or unusual network connections."},
-		{Command: "last", Prompt: "Review login history for any unusual user activity."},
-		{Command: "dscl . list /Users", Prompt: "Check for unexpected or unauthorized user accounts."},
-		{Command: "pmset -g log | grep -i failure", Prompt: "Check for power management failures or unexpected events."},
-		{Command: "sudo dmesg | tail -n 50", Prompt: "Analyze recent kernel messages for potential issues."},
-		{Command: "ls /Users/Shared", Prompt: "Check for suspicious files in the shared user directory."},
-		{Command: "launchctl list", Prompt: "Check running services/daemons for suspicious entries."},
-		{Command: "crontab -l", Prompt: "Check for suspicious cron jobs."},
-		{Command: "sudo fdesetup status", Prompt: "Check if FileVault disk encryption is enabled or disabled."},
-		{Command: "kextstat", Prompt: "Examine loaded kernel extensions for anything unusual."},
-		{Command: "sudo launchctl list | grep -v com.apple", Prompt: "Check for non-Apple launch services that might be malicious."},
-		{Command: "sudo defaults read /Library/Preferences/com.apple.loginwindow", Prompt: "Inspect login window preferences for suspicious settings."},
-		{Command: "mdutil -s /", Prompt: "Check Spotlight indexing status; unexpected changes could indicate tampering."},
-		{Command: "sudo lsof -i", Prompt: "Review open files and network connections for suspicious activity."},
-		{Command: "sudo ls -la /etc/sudoers.d", Prompt: "Check for unauthorized sudoers modifications."},
-		{Command: "cat /etc/hosts", Prompt: "Look for malicious modifications to the hosts file."},
-		{Command: "sudo tmutil listbackups", Prompt: "Check Time Machine backups for irregularities or suspicious modifications."},
-		{Command: "security find-generic-password -ga test 2>&1", Prompt: "Inspect keychain items for suspicious credentials."},
-		{Command: "sudo spctl --status", Prompt: "Check Gatekeeper status for unexpected configuration."},
-		{Command: "ioreg -l", Prompt: "Inspect hardware registry for suspicious devices or properties."},
+
+		{
+			Command: "system_profiler SPUSBDataType -json | jq '.SPUSBDataType[] | select(.\"_name\" | test(\"keyboard|mouse|storage|hub\"; \"i\"))'",
+			Prompt:  "Look for any suspicious USB devices, filtering for specific device types.",
+		},
+		{
+			Command: "ps -Ao user,pid,%cpu,%mem,comm --sort=-%cpu | head -n 20",
+			Prompt:  "Analyze top processes for unusual CPU or memory usage.",
+		},
+		{
+			Command: "netstat -an | grep -E 'ESTABLISHED|LISTEN' | awk '{print $4,$5,$6}' | uniq -c | sort -nr | head -n 20",
+			Prompt:  "Identify top suspicious or unusual network connections.",
+		},
+		{
+			Command: "last | head -n 20",
+			Prompt:  "Review the most recent login history for any unusual user activity.",
+		},
+		{
+			Command: "dscl . list /Users | grep -vE '^_.*|daemon|nobody|root'",
+			Prompt:  "Check for unexpected or unauthorized user accounts, excluding system defaults.",
+		},
+		{
+			Command: "pmset -g log | grep -i failure | tail -n 10",
+			Prompt:  "Check the last 10 power management failures or unexpected events.",
+		},
+		{
+			Command: "dmesg | tail -n 20",
+			Prompt:  "Analyze the last 20 kernel messages for potential issues.",
+		},
+		{
+			Command: "ls -lh /Users/Shared | grep -v '^d' | sort -k5,5nr | head -n 10",
+			Prompt:  "Check the largest or most recently modified suspicious files in the shared user directory.",
+		},
+		{
+			Command: "launchctl list | grep -vE 'com.apple|system' | head -n 20",
+			Prompt:  "Check non-system running services/daemons for suspicious entries.",
+		},
+		{
+			Command: "crontab -l | grep -E 'wget|curl|bash|sh' | tail -n 10",
+			Prompt:  "Check for potentially suspicious cron jobs.",
+		},
+		{
+			Command: "fdesetup status",
+			Prompt:  "Check if FileVault disk encryption is enabled or disabled.",
+		},
+		{
+			Command: "kextstat | grep -v com.apple",
+			Prompt:  "Examine loaded kernel extensions for anything unusual, excluding Apple-signed extensions.",
+		},
+		{
+			Command: "launchctl list | grep -vE 'com.apple|system'",
+			Prompt:  "Check for non-Apple launch services that might be malicious.",
+		},
+		{
+			Command: "defaults read /Library/Preferences/com.apple.loginwindow | grep -vE 'default values|empty'",
+			Prompt:  "Inspect login window preferences for suspicious settings, filtering irrelevant defaults.",
+		},
+		{
+			Command: "mdutil -s / | grep -iE 'enabled|disabled'",
+			Prompt:  "Check Spotlight indexing status; unexpected changes could indicate tampering.",
+		},
+		{
+			Command: "lsof -i | grep -E 'LISTEN|ESTABLISHED'",
+			Prompt:  "Review open files and network connections for suspicious activity, focusing on active connections.",
+		},
+		{
+			Command: "ls -la /etc/sudoers.d | grep -v '^total'",
+			Prompt:  "Check for unauthorized sudoers modifications, ignoring summary lines.",
+		},
+		{
+			Command: "fdesetup status",
+			Prompt:  "Check if FileVault disk encryption is enabled or disabled.",
+		},
+		{
+			Command: "kextstat | grep -v com.apple",
+			Prompt:  "Examine loaded kernel extensions for anything unusual, excluding Apple-signed extensions.",
+		},
+		{
+			Command: "launchctl list | grep -vE 'com.apple|system'",
+			Prompt:  "Check for non-Apple launch services that might be malicious.",
+		},
+		{
+			Command: "defaults read /Library/Preferences/com.apple.loginwindow | grep -vE 'default values|empty'",
+			Prompt:  "Inspect login window preferences for suspicious settings, filtering irrelevant defaults.",
+		},
+		{
+			Command: "mdutil -s / | grep -iE 'enabled|disabled'",
+			Prompt:  "Check Spotlight indexing status; unexpected changes could indicate tampering.",
+		},
+		{
+			Command: "lsof -i | grep -E 'LISTEN|ESTABLISHED'",
+			Prompt:  "Review open files and network connections for suspicious activity, focusing on active connections.",
+		},
+		{
+			Command: "ls -la /etc/sudoers.d | grep -v '^total'",
+			Prompt:  "Check for unauthorized sudoers modifications, ignoring summary lines.",
+		},
 	},
+}
+
+func detectOS() string {
+	switch os := runtime.GOOS; os {
+	case "darwin":
+		return "macOS"
+	case "linux":
+		return "Linux"
+	case "windows":
+		return "Windows"
+	default:
+		return "Unsupported OS"
+	}
 }
 
 // callOpenAI sends a prompt to the OpenAI ChatCompletion API and returns a GPTResponse.
 func callOpenAI(client *openai.Client, prompt string) (GPTResponse, error) {
-	systemMessage := `You are a careful and accurate system analyst. 
-Your task is to evaluate the provided command output in the context of the given prompt and determine if there is any truly suspicious activity.
+	os := detectOS()
+
+	systemMessage := `You are a careful and accurate system analyst. Our operating system is ` + os + `.
+Your task is to evaluate the provided command output in the context of the given prompt and determine if there is any truly suspicious activity. If you identify any issues, set flagged to true, provide a description of the problem and a follow up GPT prompt terminal command to analyse it in a more detailed way.
 Return data as JSON:
 {
   "flagged": boolean,
@@ -124,13 +217,23 @@ Do not include any extra text outside of the JSON object.`
 	return gptResp, nil
 }
 
-// executeCommand runs a shell command and returns its combined output.
+// executeCommand runs a shell command with a timeout and returns its combined output.
 func executeCommand(command string) (string, error) {
-	cmd := exec.Command("sh", "-c", command)
+	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "sh", "-c", command)
 	output, err := cmd.CombinedOutput()
+
+	// Check if the context deadline was exceeded (timeout case)
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return "", errors.New("command execution timed out")
+	}
+
 	if err != nil {
 		return "", fmt.Errorf("failed to execute command: %s, error: %w", command, err)
 	}
+
 	return string(output), nil
 }
 
@@ -149,17 +252,10 @@ func analyze(client *openai.Client, prompt, command string, depth int) (Analysis
 		Command: command,
 	}
 
-	// If no command, just analyze the prompt directly
+	// If no command, don't do anything
 	if command == "" {
-		response, err := callOpenAI(client, prompt)
-		if err != nil {
-			item.Flagged = false
-			item.AnalysisDescription = fmt.Sprintf("OpenAI API error: %v", err)
-			return item, nil
-		}
-		item.Flagged = response.Flagged
-		item.AnalysisDescription = response.Description
-		item.Alert = response.Alert
+		item.Flagged = false
+		item.AnalysisDescription = "No command provided"
 		return item, nil
 	}
 
@@ -174,7 +270,7 @@ func analyze(client *openai.Client, prompt, command string, depth int) (Analysis
 
 	// Truncate and prepare for analysis
 	truncatedOutput := truncateOutput(commandOutput, maxOutputCharacters)
-	fullPrompt := fmt.Sprintf("%s\n\nCommand output (truncated if necessary):\n%s", prompt, truncatedOutput)
+	fullPrompt := fmt.Sprintf("%s\n\nCommand output (truncated):\n%s", command, truncatedOutput)
 
 	// Analyze with OpenAI
 	response, err := callOpenAI(client, fullPrompt)
@@ -204,11 +300,6 @@ func analyze(client *openai.Client, prompt, command string, depth int) (Analysis
 		}
 		// Append the follow-up result
 		item.FollowUps = append(item.FollowUps, followupItem)
-
-		// Update the main item's state based on the follow-up result
-		//item.Flagged = followupItem.Flagged // TODO: Decide how to handle this
-		item.AnalysisDescription = followupItem.AnalysisDescription
-		item.Alert = followupItem.Alert
 
 		// If the follow-up item is flagged and suggests another follow-up, continue
 		if len(followupItem.FollowUps) > 0 {
@@ -268,4 +359,10 @@ func main() {
 	}
 
 	db.CreateLog(time.Now(), string(reportString))
+
+	// save the report to a file report.json
+	err = os.WriteFile("report.json", reportString, 0644)
+	if err != nil {
+		fmt.Printf("Error writing report to file: %v\n", err)
+	}
 }

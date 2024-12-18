@@ -7,8 +7,11 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 
 	openai "github.com/sashabaranov/go-openai"
+
+	"github.com/audi70r/diligent/db"
 )
 
 const (
@@ -238,6 +241,12 @@ func main() {
 		return
 	}
 
+	err := db.InitDB()
+	if err != nil {
+		fmt.Printf("Error initializing database: %v\n", err)
+		return
+	}
+
 	client := openai.NewClient(apiKey)
 
 	// Analyze each check and store results
@@ -253,19 +262,10 @@ func main() {
 
 	report := Report{Items: results}
 
-	// marshal the report to JSON
-	reportJSON, err := json.MarshalIndent(report, "", "  ")
+	reportString, err := json.MarshalIndent(report, "", "  ")
 	if err != nil {
-		fmt.Printf("Error marshaling report: %v\n", err)
-		return
+		fmt.Printf("Error marshalling report: %v\n", err)
 	}
 
-	// Save the report to a file (optional, can also just print)
-	err = os.WriteFile("report.json", reportJSON, 0644)
-	if err != nil {
-		fmt.Printf("Error writing report to file: %v\n", err)
-		return
-	}
-
-	fmt.Println("\nDetailed Report saved to report.json")
+	db.CreateLog(time.Now(), string(reportString))
 }
